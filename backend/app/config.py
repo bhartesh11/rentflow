@@ -3,7 +3,7 @@ from typing import List
 
 
 class Settings(BaseSettings):
-    mongo_uri: str = "mongodb://localhost:27017"
+    mongo_uri: str = "mongodb+srv://bharteshsingh11_db_user:VmIrw2vUQJQduFOZ@cluster0.1asaoly.mongodb.net"
     mongo_db_name: str = "rentflow"
 
     jwt_secret: str = "insecure-dev-secret-change-me"
