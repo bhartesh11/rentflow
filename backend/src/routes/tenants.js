@@ -1,14 +1,15 @@
 const express = require("express");
-const { ObjectId } = require("mongodb");
+const { Types } = require("mongoose");
 
 const { TenantCreate, TenantUpdate } = require("../validation/schemas");
 const { validateBody } = require("../middleware/validate");
-const { tenantsCol, roomsCol, usersCol } = require("../database");
+const { Tenant, Room, User } = require("../database");
 const { requireOwner, requireTenant, hashPassword } = require("../auth");
 const { serialize, serializeList, toObjectId } = require("../utils/helpers");
 const { asyncHandler } = require("../utils/asyncHandler");
 const { HttpError } = require("../utils/httpError");
 
+const { ObjectId } = Types;
 const router = express.Router();
 
 async function attachRoomNames(tenants) {
@@ -17,8 +18,8 @@ async function attachRoomNames(tenants) {
   );
   const rooms = {};
   if (roomIds.length) {
-    const cursor = roomsCol.find({ _id: { $in: roomIds } });
-    for await (const r of cursor) {
+    const found = await Room.find({ _id: { $in: roomIds } }).lean();
+    for (const r of found) {
       rooms[String(r._id)] = r.name;
     }
   }
@@ -29,12 +30,12 @@ async function attachRoomNames(tenants) {
 }
 
 // IMPORTANT: '/me' must be declared before '/:tenantId' so it isn't
-// swallowed by the parameterized route (mirrors FastAPI's route ordering).
+// swallowed by the parameterized route.
 router.get(
   "/me",
   requireTenant,
   asyncHandler(async (req, res) => {
-    const tenant = await tenantsCol.findOne({ _id: new ObjectId(req.user.tenant_id) });
+    const tenant = await Tenant.findById(req.user.tenant_id).lean();
     if (!tenant) {
       throw new HttpError(404, "Tenant profile not found");
     }
@@ -47,7 +48,7 @@ router.get(
   "",
   requireOwner,
   asyncHandler(async (req, res) => {
-    let tenants = await tenantsCol.find().sort({ created_at: -1 }).limit(1000).toArray();
+    let tenants = await Tenant.find().sort({ created_at: -1 }).limit(1000).lean();
     tenants = await attachRoomNames(tenants);
     res.json(serializeList(tenants));
   })
@@ -59,7 +60,7 @@ router.post(
   validateBody(TenantCreate),
   asyncHandler(async (req, res) => {
     const payload = req.body;
-    const existing = await tenantsCol.findOne({ email: payload.email.toLowerCase() });
+    const existing = await Tenant.findOne({ email: payload.email.toLowerCase() }).lean();
     if (existing) {
       throw new HttpError(400, "A tenant with this email already exists");
     }
@@ -68,7 +69,6 @@ router.post(
     const doc = { ...rest };
     doc.email = doc.email.toLowerCase();
     doc.status = "active";
-    doc.created_at = new Date();
     if (doc.room_id) {
       if (!ObjectId.isValid(doc.room_id)) {
         throw new HttpError(400, "Invalid room id");
@@ -76,28 +76,26 @@ router.post(
       doc.room_id = new ObjectId(doc.room_id);
     }
 
-    const result = await tenantsCol.insertOne(doc);
+    const tenant = await Tenant.create(doc);
 
     if (doc.room_id) {
-      await roomsCol.updateOne({ _id: doc.room_id }, { $set: { status: "occupied" } });
+      await Room.updateOne({ _id: doc.room_id }, { $set: { status: "occupied" } });
     }
 
     if (set_password) {
-      const existingUser = await usersCol.findOne({ email: doc.email });
+      const existingUser = await User.findOne({ email: doc.email }).lean();
       if (!existingUser) {
-        await usersCol.insertOne({
+        await User.create({
           name: payload.name,
           email: doc.email,
           password_hash: await hashPassword(set_password),
           role: "tenant",
-          tenant_id: result.insertedId,
-          created_at: new Date(),
+          tenant_id: tenant._id,
         });
       }
     }
 
-    const tenant = await tenantsCol.findOne({ _id: result.insertedId });
-    res.json(serialize(tenant));
+    res.json(serialize(tenant.toObject()));
   })
 );
 
@@ -107,7 +105,7 @@ router.put(
   validateBody(TenantUpdate),
   asyncHandler(async (req, res) => {
     const oid = toObjectId(req.params.tenantId);
-    const tenant = await tenantsCol.findOne({ _id: oid });
+    const tenant = await Tenant.findById(oid).lean();
     if (!tenant) {
       throw new HttpError(404, "Tenant not found");
     }
@@ -126,28 +124,28 @@ router.put(
     }
 
     if (Object.keys(updates).length > 0) {
-      await tenantsCol.updateOne({ _id: oid }, { $set: updates });
+      await Tenant.updateOne({ _id: oid }, { $set: updates });
     }
 
     // Keep room occupancy status in sync
     if (newRoomId && (!oldRoomId || String(newRoomId) !== String(oldRoomId))) {
-      await roomsCol.updateOne({ _id: newRoomId }, { $set: { status: "occupied" } });
+      await Room.updateOne({ _id: newRoomId }, { $set: { status: "occupied" } });
       if (oldRoomId) {
-        const remaining = await tenantsCol.countDocuments({ room_id: oldRoomId, status: "active" });
+        const remaining = await Tenant.countDocuments({ room_id: oldRoomId, status: "active" });
         if (remaining === 0) {
-          await roomsCol.updateOne({ _id: oldRoomId }, { $set: { status: "vacant" } });
+          await Room.updateOne({ _id: oldRoomId }, { $set: { status: "vacant" } });
         }
       }
     }
 
     if (updates.status === "vacated" && oldRoomId) {
-      const remaining = await tenantsCol.countDocuments({ room_id: oldRoomId, status: "active" });
+      const remaining = await Tenant.countDocuments({ room_id: oldRoomId, status: "active" });
       if (remaining === 0) {
-        await roomsCol.updateOne({ _id: oldRoomId }, { $set: { status: "vacant" } });
+        await Room.updateOne({ _id: oldRoomId }, { $set: { status: "vacant" } });
       }
     }
 
-    const updated = await tenantsCol.findOne({ _id: oid });
+    const updated = await Tenant.findById(oid).lean();
     res.json(serialize(updated));
   })
 );
@@ -157,16 +155,16 @@ router.delete(
   requireOwner,
   asyncHandler(async (req, res) => {
     const oid = toObjectId(req.params.tenantId);
-    const tenant = await tenantsCol.findOne({ _id: oid });
+    const tenant = await Tenant.findById(oid).lean();
     if (!tenant) {
       throw new HttpError(404, "Tenant not found");
     }
-    await tenantsCol.deleteOne({ _id: oid });
-    await usersCol.deleteMany({ tenant_id: oid });
+    await Tenant.deleteOne({ _id: oid });
+    await User.deleteMany({ tenant_id: oid });
     if (tenant.room_id) {
-      const remaining = await tenantsCol.countDocuments({ room_id: tenant.room_id, status: "active" });
+      const remaining = await Tenant.countDocuments({ room_id: tenant.room_id, status: "active" });
       if (remaining === 0) {
-        await roomsCol.updateOne({ _id: tenant.room_id }, { $set: { status: "vacant" } });
+        await Room.updateOne({ _id: tenant.room_id }, { $set: { status: "vacant" } });
       }
     }
     res.json({ deleted: true });

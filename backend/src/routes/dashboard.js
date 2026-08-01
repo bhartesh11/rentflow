@@ -1,6 +1,6 @@
 const express = require("express");
 
-const { roomsCol, tenantsCol, billsCol, paymentsCol } = require("../database");
+const { Room, Tenant, Bill, Payment } = require("../database");
 const { requireOwner } = require("../auth");
 const { serializeList } = require("../utils/helpers");
 const { asyncHandler } = require("../utils/asyncHandler");
@@ -24,24 +24,23 @@ router.get(
   "/stats",
   requireOwner,
   asyncHandler(async (req, res) => {
-    const totalRooms = await roomsCol.countDocuments({});
-    const occupiedRooms = await roomsCol.countDocuments({ status: "occupied" });
-    const activeTenants = await tenantsCol.countDocuments({ status: "active" });
+    const totalRooms = await Room.countDocuments({});
+    const occupiedRooms = await Room.countDocuments({ status: "occupied" });
+    const activeTenants = await Tenant.countDocuments({ status: "active" });
 
     const today = todayIso();
     const thisMonth = today.slice(0, 7);
-    const billsThisMonth = await billsCol.find({ month: thisMonth }).limit(1000).toArray();
+    const billsThisMonth = await Bill.find({ month: thisMonth }).limit(1000).lean();
     const totalBilled = billsThisMonth.reduce((s, b) => s + b.total_amount, 0);
     const totalCollectedThisMonth = billsThisMonth.reduce((s, b) => s + b.amount_paid, 0);
 
-    const allUnpaid = await billsCol
-      .find({ $expr: { $lt: ["$amount_paid", "$total_amount"] } })
+    const allUnpaid = await Bill.find({ $expr: { $lt: ["$amount_paid", "$total_amount"] } })
       .limit(2000)
-      .toArray();
+      .lean();
     const totalDues = allUnpaid.reduce((s, b) => s + (b.total_amount - b.amount_paid), 0);
     const overdueCount = allUnpaid.filter((b) => b.due_date && b.due_date < today).length;
 
-    const allPayments = await paymentsCol.find().limit(5000).toArray();
+    const allPayments = await Payment.find().limit(5000).lean();
     const totalCollectedAllTime = allPayments.reduce((s, p) => s + p.amount, 0);
 
     // last 6 months collection trend
@@ -59,7 +58,7 @@ router.get(
 
     const trend = [];
     for (const m of months) {
-      const monthBills = m === thisMonth ? billsThisMonth : await billsCol.find({ month: m }).limit(1000).toArray();
+      const monthBills = m === thisMonth ? billsThisMonth : await Bill.find({ month: m }).limit(1000).lean();
       trend.push({
         month: m,
         billed: monthBills.reduce((s, b) => s + b.total_amount, 0),
@@ -67,10 +66,10 @@ router.get(
       });
     }
 
-    const recentPayments = await paymentsCol.find().sort({ created_at: -1 }).limit(5).toArray();
+    const recentPayments = await Payment.find().sort({ created_at: -1 }).limit(5).lean();
     const tenantsMap = {};
-    const cursor = tenantsCol.find({}, { projection: { name: 1 } });
-    for await (const t of cursor) {
+    const found = await Tenant.find({}, { name: 1 }).lean();
+    for (const t of found) {
       tenantsMap[String(t._id)] = t.name;
     }
     for (const p of recentPayments) {

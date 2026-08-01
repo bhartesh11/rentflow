@@ -10,7 +10,7 @@ numbering, dashboard aggregates, etc).
 | Concern            | Python original          | Node.js port                  |
 |---------------------|---------------------------|--------------------------------|
 | Web framework        | FastAPI                  | Express                        |
-| MongoDB driver        | Motor (async)             | `mongodb` (official async driver) |
+| MongoDB driver        | Motor (async)             | `mongoose` (ODM)               |
 | Password hashing      | passlib (bcrypt)          | `bcryptjs`                     |
 | JWT                    | python-jose                | `jsonwebtoken`                 |
 | Request validation     | Pydantic                    | `zod`                           |
@@ -31,7 +31,7 @@ Requires a running MongoDB instance reachable at `MONGO_URI`.
 ```
 src/
   config.js            environment settings (mirrors app/config.py)
-  database.js          Mongo client, collections, counters, indexes
+  database.js          Mongoose connection, schemas/models, counters, indexes
   auth.js              password hashing, JWT, auth middleware
   app.js               Express app + route mounting (mirrors app/main.py)
   server.js            startup: connect DB, seed owner account, listen
@@ -56,6 +56,13 @@ src/
   `Authorization: Bearer <token>` header, same 401/403 semantics.
 - **IDs**: Mongo `_id` is always exposed to clients as `id` (string), exactly
   as in the original `serialize()` helper.
+- **Mongoose usage**: schemas live in `src/database.js` and mirror the
+  original collections 1:1 (`users`, `rooms`, `tenants`, `bills`, `payments`,
+  `maintenance_requests`, `counters`), including the same field names, enum
+  values, and unique/sparse indexes. Reads use `.lean()` so route logic works
+  with plain JS objects (same shape as the old native-driver documents)
+  instead of full Mongoose documents; writes use `Model.create()` /
+  `updateOne()` / `deleteOne()`.
 - **Bill status** (`unpaid` / `partial` / `paid` / `overdue` / `partial_overdue`)
   is computed identically, comparing `YYYY-MM-DD` due-date strings against
   today's date as strings (avoids timezone edge cases that a `Date` object

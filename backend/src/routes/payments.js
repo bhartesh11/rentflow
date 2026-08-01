@@ -1,9 +1,9 @@
 const express = require("express");
-const { ObjectId } = require("mongodb");
+const { Types } = require("mongoose");
 
 const { PaymentCreate } = require("../validation/schemas");
 const { validateBody } = require("../middleware/validate");
-const { paymentsCol, billsCol, tenantsCol, nextSequence } = require("../database");
+const { Payment, Bill, Tenant, nextSequence } = require("../database");
 const { requireOwner, getCurrentUser } = require("../auth");
 const { serialize, serializeList, toObjectId } = require("../utils/helpers");
 const { asyncHandler } = require("../utils/asyncHandler");
@@ -12,6 +12,7 @@ const { generateReceiptPdf } = require("../utils/pdf");
 const { settings } = require("../config");
 const { computeStatus } = require("./bills");
 
+const { ObjectId } = Types;
 const router = express.Router();
 
 function todayIso() {
@@ -28,7 +29,7 @@ router.post(
   validateBody(PaymentCreate),
   asyncHandler(async (req, res) => {
     const payload = req.body;
-    const bill = await billsCol.findOne({ _id: toObjectId(payload.bill_id) });
+    const bill = await Bill.findById(toObjectId(payload.bill_id)).lean();
     if (!bill) {
       throw new HttpError(404, "Bill not found");
     }
@@ -45,7 +46,7 @@ router.post(
     const seq = await nextSequence("payment");
     const paidOn = payload.paid_on || todayIso();
 
-    const paymentDoc = {
+    const payment = await Payment.create({
       receipt_number: `RCPT-${new Date().getUTCFullYear()}-${String(seq).padStart(5, "0")}`,
       bill_id: bill._id,
       tenant_id: bill.tenant_id,
@@ -53,20 +54,17 @@ router.post(
       method: payload.method,
       paid_on: paidOn,
       note: payload.note || null,
-      created_at: new Date(),
-    };
-    const result = await paymentsCol.insertOne(paymentDoc);
+    });
 
     const newPaid = bill.amount_paid + payload.amount;
     const newBalance = bill.total_amount - newPaid;
     const newStatus = computeStatus(bill.total_amount, newPaid, bill.due_date);
-    await billsCol.updateOne(
+    await Bill.updateOne(
       { _id: bill._id },
       { $set: { amount_paid: newPaid, balance: newBalance, status: newStatus } }
     );
 
-    const payment = await paymentsCol.findOne({ _id: result.insertedId });
-    res.json(serialize(payment));
+    res.json(serialize(payment.toObject()));
   })
 );
 
@@ -85,13 +83,13 @@ router.get(
       query.bill_id = toObjectId(billId);
     }
 
-    const payments = await paymentsCol.find(query).sort({ created_at: -1 }).limit(1000).toArray();
+    const payments = await Payment.find(query).sort({ created_at: -1 }).limit(1000).lean();
 
     const tenantIds = [...new Set(payments.map((p) => String(p.tenant_id)))].map((id) => new ObjectId(id));
     const tenants = {};
     if (tenantIds.length) {
-      const cursor = tenantsCol.find({ _id: { $in: tenantIds } });
-      for await (const t of cursor) {
+      const found = await Tenant.find({ _id: { $in: tenantIds } }).lean();
+      for (const t of found) {
         tenants[String(t._id)] = t.name;
       }
     }
@@ -107,7 +105,7 @@ router.get(
   "/:paymentId/receipt.pdf",
   getCurrentUser,
   asyncHandler(async (req, res) => {
-    const payment = await paymentsCol.findOne({ _id: toObjectId(req.params.paymentId) });
+    const payment = await Payment.findById(toObjectId(req.params.paymentId)).lean();
     if (!payment) {
       throw new HttpError(404, "Payment not found");
     }
@@ -115,8 +113,8 @@ router.get(
       throw new HttpError(403, "Not authorized");
     }
 
-    const bill = await billsCol.findOne({ _id: payment.bill_id });
-    const tenant = await tenantsCol.findOne({ _id: payment.tenant_id });
+    const bill = await Bill.findById(payment.bill_id).lean();
+    const tenant = await Tenant.findById(payment.tenant_id).lean();
     const pdfBytes = await generateReceiptPdf(payment, bill, tenant, settings.ownerName);
     res.set({
       "Content-Type": "application/pdf",

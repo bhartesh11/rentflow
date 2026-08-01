@@ -1,6 +1,9 @@
-const { ObjectId } = require("mongodb");
+const { Types } = require("mongoose");
 
-/** Convert a Mongo document into a JSON-safe object (string ids, no internal fields). */
+const { ObjectId } = Types;
+
+/** Convert a Mongo document (typically a `.lean()` result) into a JSON-safe
+ * object (string ids, no internal fields). */
 function serialize(doc) {
   if (doc === null || doc === undefined) return null;
   const out = {};
@@ -11,7 +14,7 @@ function serialize(doc) {
       out[k] = String(v);
     } else if (v instanceof Date) {
       out[k] = v.toISOString();
-    } else if (k === "password_hash") {
+    } else if (k === "password_hash" || k === "__v") {
       continue;
     } else {
       out[k] = v;

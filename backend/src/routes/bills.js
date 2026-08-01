@@ -1,9 +1,9 @@
 const express = require("express");
-const { ObjectId } = require("mongodb");
+const { Types } = require("mongoose");
 
 const { BillCreate, BulkBillGenerate, BillUpdate } = require("../validation/schemas");
 const { validateBody } = require("../middleware/validate");
-const { billsCol, tenantsCol, roomsCol, nextSequence } = require("../database");
+const { Bill, Tenant, Room, nextSequence } = require("../database");
 const { requireOwner, getCurrentUser } = require("../auth");
 const { serialize, serializeList, toObjectId } = require("../utils/helpers");
 const { asyncHandler } = require("../utils/asyncHandler");
@@ -11,6 +11,7 @@ const { HttpError } = require("../utils/httpError");
 const { generateInvoicePdf } = require("../utils/pdf");
 const { settings } = require("../config");
 
+const { ObjectId } = Types;
 const router = express.Router();
 
 /** "YYYY-MM-DD" strings sort lexically the same as chronologically, so plain
@@ -50,7 +51,6 @@ async function buildBillDoc(tenant, month, rentAmount, lineItems, dueDate, notes
     due_date: dueDate,
     status: computeStatus(total, 0, dueDate),
     notes: notes || null,
-    created_at: new Date(),
   };
 }
 
@@ -60,11 +60,11 @@ router.post(
   validateBody(BillCreate),
   asyncHandler(async (req, res) => {
     const payload = req.body;
-    const tenant = await tenantsCol.findOne({ _id: toObjectId(payload.tenant_id) });
+    const tenant = await Tenant.findById(toObjectId(payload.tenant_id)).lean();
     if (!tenant) {
       throw new HttpError(404, "Tenant not found");
     }
-    const existing = await billsCol.findOne({ tenant_id: tenant._id, month: payload.month });
+    const existing = await Bill.findOne({ tenant_id: tenant._id, month: payload.month }).lean();
     if (existing) {
       throw new HttpError(400, "A bill for this tenant and month already exists");
     }
@@ -76,9 +76,8 @@ router.post(
       payload.due_date,
       payload.notes
     );
-    const result = await billsCol.insertOne(doc);
-    const bill = await billsCol.findOne({ _id: result.insertedId });
-    res.json(serialize(bill));
+    const bill = await Bill.create(doc);
+    res.json(serialize(bill.toObject()));
   })
 );
 
@@ -92,17 +91,17 @@ router.post(
     if (payload.tenant_ids) {
       query._id = { $in: payload.tenant_ids.map((t) => toObjectId(t)) };
     }
-    const tenants = await tenantsCol.find(query).limit(1000).toArray();
+    const tenants = await Tenant.find(query).limit(1000).lean();
 
     const created = [];
     const skipped = [];
     for (const tenant of tenants) {
-      const existing = await billsCol.findOne({ tenant_id: tenant._id, month: payload.month });
+      const existing = await Bill.findOne({ tenant_id: tenant._id, month: payload.month }).lean();
       if (existing) {
         skipped.push(tenant.name);
         continue;
       }
-      const room = tenant.room_id ? await roomsCol.findOne({ _id: tenant.room_id }) : null;
+      const room = tenant.room_id ? await Room.findById(tenant.room_id).lean() : null;
       const rentAmount = room ? room.monthly_rent : 0;
       const doc = await buildBillDoc(
         tenant,
@@ -111,8 +110,8 @@ router.post(
         payload.include_utilities,
         payload.due_date
       );
-      const result = await billsCol.insertOne(doc);
-      created.push(String(result.insertedId));
+      const bill = await Bill.create(doc);
+      created.push(String(bill._id));
     }
 
     res.json({ created: created.length, skipped, bill_ids: created });
@@ -134,13 +133,13 @@ router.get(
       query.month = month;
     }
 
-    let bills = await billsCol.find(query).sort({ created_at: -1 }).limit(1000).toArray();
+    let bills = await Bill.find(query).sort({ created_at: -1 }).limit(1000).lean();
 
     const tenantIds = [...new Set(bills.map((b) => String(b.tenant_id)))].map((id) => new ObjectId(id));
     const tenants = {};
     if (tenantIds.length) {
-      const cursor = tenantsCol.find({ _id: { $in: tenantIds } });
-      for await (const t of cursor) {
+      const found = await Tenant.find({ _id: { $in: tenantIds } }).lean();
+      for (const t of found) {
         tenants[String(t._id)] = t.name;
       }
     }
@@ -158,7 +157,7 @@ router.get(
 );
 
 async function getBillWithAccess(billId, user) {
-  const bill = await billsCol.findOne({ _id: toObjectId(billId) });
+  const bill = await Bill.findById(toObjectId(billId)).lean();
   if (!bill) {
     throw new HttpError(404, "Bill not found");
   }
@@ -184,7 +183,7 @@ router.put(
   validateBody(BillUpdate),
   asyncHandler(async (req, res) => {
     const oid = toObjectId(req.params.billId);
-    const bill = await billsCol.findOne({ _id: oid });
+    const bill = await Bill.findById(oid).lean();
     if (!bill) {
       throw new HttpError(404, "Bill not found");
     }
@@ -207,9 +206,9 @@ router.put(
     }
 
     if (Object.keys(updates).length > 0) {
-      await billsCol.updateOne({ _id: oid }, { $set: updates });
+      await Bill.updateOne({ _id: oid }, { $set: updates });
     }
-    const updated = await billsCol.findOne({ _id: oid });
+    const updated = await Bill.findById(oid).lean();
     res.json(serialize(updated));
   })
 );
@@ -219,7 +218,7 @@ router.delete(
   requireOwner,
   asyncHandler(async (req, res) => {
     const oid = toObjectId(req.params.billId);
-    const result = await billsCol.deleteOne({ _id: oid });
+    const result = await Bill.deleteOne({ _id: oid });
     if (result.deletedCount === 0) {
       throw new HttpError(404, "Bill not found");
     }
@@ -232,8 +231,8 @@ router.get(
   getCurrentUser,
   asyncHandler(async (req, res) => {
     const bill = await getBillWithAccess(req.params.billId, req.user);
-    const tenant = await tenantsCol.findOne({ _id: bill.tenant_id });
-    const room = bill.room_id ? await roomsCol.findOne({ _id: bill.room_id }) : null;
+    const tenant = await Tenant.findById(bill.tenant_id).lean();
+    const room = bill.room_id ? await Room.findById(bill.room_id).lean() : null;
     const pdfBytes = await generateInvoicePdf(bill, tenant, room, settings.ownerName);
     res.set({
       "Content-Type": "application/pdf",

@@ -1,16 +1,15 @@
 const express = require("express");
-const { ObjectId } = require("mongodb");
 
 const { LoginRequest, TenantRegisterRequest } = require("../validation/schemas");
 const { validateBody } = require("../middleware/validate");
-const { usersCol, tenantsCol, roomsCol } = require("../database");
+const { User, Tenant, Room } = require("../database");
 const {
   hashPassword,
   verifyPassword,
   createAccessToken,
   getCurrentUser,
 } = require("../auth");
-const { serialize } = require("../utils/helpers");
+const { serialize, toObjectId } = require("../utils/helpers");
 const { asyncHandler } = require("../utils/asyncHandler");
 const { HttpError } = require("../utils/httpError");
 
@@ -32,7 +31,7 @@ router.post(
   validateBody(LoginRequest),
   asyncHandler(async (req, res) => {
     const payload = req.body;
-    const user = await usersCol.findOne({ email: payload.email.toLowerCase() });
+    const user = await User.findOne({ email: payload.email.toLowerCase() }).lean();
     if (!user || !(await verifyPassword(payload.password, user.password_hash))) {
       throw new HttpError(401, "Invalid email or password");
     }
@@ -64,15 +63,17 @@ router.post(
   asyncHandler(async (req, res) => {
     const payload = req.body;
 
-    const existingUser = await usersCol.findOne({ email: payload.email.toLowerCase() });
+    const existingUser = await User.findOne({ email: payload.email.toLowerCase() }).lean();
     if (existingUser) {
       throw new HttpError(400, "An account with this email already exists");
     }
 
     let room = null;
     if (payload.invite_code) {
-      if (ObjectId.isValid(payload.invite_code)) {
-        room = await roomsCol.findOne({ _id: new ObjectId(payload.invite_code) });
+      try {
+        room = await Room.findById(toObjectId(payload.invite_code)).lean();
+      } catch {
+        room = null;
       }
       if (!room) {
         throw new HttpError(400, "Invalid invite code / room code");
@@ -81,14 +82,14 @@ router.post(
 
     // If owner already pre-created a tenant record with this email, attach to it
     let tenantId;
-    const existingTenant = await tenantsCol.findOne({ email: payload.email.toLowerCase() });
+    const existingTenant = await Tenant.findOne({ email: payload.email.toLowerCase() }).lean();
     if (existingTenant) {
       tenantId = existingTenant._id;
       const update = { name: payload.name, phone: payload.phone };
       if (room) update.room_id = room._id;
-      await tenantsCol.updateOne({ _id: tenantId }, { $set: update });
+      await Tenant.updateOne({ _id: tenantId }, { $set: update });
     } else {
-      const tenantDoc = {
+      const tenantDoc = await Tenant.create({
         name: payload.name,
         email: payload.email.toLowerCase(),
         phone: payload.phone,
@@ -96,28 +97,24 @@ router.post(
         move_in_date: new Date().toISOString().slice(0, 10),
         status: "active",
         security_deposit: 0,
-        created_at: new Date(),
-      };
-      const result = await tenantsCol.insertOne(tenantDoc);
-      tenantId = result.insertedId;
+      });
+      tenantId = tenantDoc._id;
     }
 
     if (room) {
-      await roomsCol.updateOne({ _id: room._id }, { $set: { status: "occupied" } });
+      await Room.updateOne({ _id: room._id }, { $set: { status: "occupied" } });
     }
 
-    const userDoc = {
+    const newUser = await User.create({
       name: payload.name,
       email: payload.email.toLowerCase(),
       password_hash: await hashPassword(payload.password),
       role: "tenant",
       tenant_id: tenantId,
-      created_at: new Date(),
-    };
-    const result = await usersCol.insertOne(userDoc);
+    });
 
     const token = createAccessToken({
-      sub: String(result.insertedId),
+      sub: String(newUser._id),
       role: "tenant",
       tenant_id: String(tenantId),
     });
@@ -127,7 +124,7 @@ router.post(
         accessToken: token,
         role: "tenant",
         name: payload.name,
-        userId: String(result.insertedId),
+        userId: String(newUser._id),
         tenantId: String(tenantId),
       })
     );

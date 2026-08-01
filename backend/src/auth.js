@@ -1,11 +1,12 @@
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
-const { ObjectId } = require("mongodb");
+const { Types } = require("mongoose");
 
 const { settings } = require("./config");
-const { usersCol } = require("./database");
+const { User } = require("./database");
 const { HttpError } = require("./utils/httpError");
 
+const { ObjectId } = Types;
 const BCRYPT_ROUNDS = 12;
 
 async function hashPassword(password) {
@@ -35,7 +36,7 @@ function decodeToken(token) {
   }
 }
 
-/** Extracts and validates the Bearer token, attaches the current user to req.user. */
+/** Extracts and validates the Bearer token. */
 function extractBearerToken(req) {
   const header = req.headers.authorization || "";
   const [scheme, token] = header.split(" ");
@@ -56,7 +57,7 @@ async function getCurrentUser(req, res, next) {
     if (!ObjectId.isValid(userId)) {
       throw new HttpError(401, "User not found");
     }
-    const user = await usersCol.findOne({ _id: new ObjectId(userId) });
+    const user = await User.findById(userId).lean();
     if (!user) {
       throw new HttpError(401, "User not found");
     }

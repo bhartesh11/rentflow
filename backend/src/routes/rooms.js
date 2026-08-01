@@ -2,7 +2,7 @@ const express = require("express");
 
 const { RoomCreate, RoomUpdate } = require("../validation/schemas");
 const { validateBody } = require("../middleware/validate");
-const { roomsCol, tenantsCol } = require("../database");
+const { Room, Tenant } = require("../database");
 const { requireOwner } = require("../auth");
 const { serialize, serializeList, toObjectId } = require("../utils/helpers");
 const { asyncHandler } = require("../utils/asyncHandler");
@@ -14,7 +14,7 @@ router.get(
   "",
   requireOwner,
   asyncHandler(async (req, res) => {
-    const rooms = await roomsCol.find().sort({ name: 1 }).limit(1000).toArray();
+    const rooms = await Room.find().sort({ name: 1 }).limit(1000).lean();
     res.json(serializeList(rooms));
   })
 );
@@ -24,12 +24,9 @@ router.post(
   requireOwner,
   validateBody(RoomCreate),
   asyncHandler(async (req, res) => {
-    const doc = { ...req.body };
-    doc.status = "vacant";
-    doc.created_at = new Date();
-    const result = await roomsCol.insertOne(doc);
-    const room = await roomsCol.findOne({ _id: result.insertedId });
-    res.json(serialize(room));
+    const doc = { ...req.body, status: "vacant" };
+    const room = await Room.create(doc);
+    res.json(serialize(room.toObject()));
   })
 );
 
@@ -50,11 +47,11 @@ router.put(
     if (Object.keys(updates).length === 0) {
       throw new HttpError(400, "No fields to update");
     }
-    const result = await roomsCol.updateOne({ _id: oid }, { $set: updates });
+    const result = await Room.updateOne({ _id: oid }, { $set: updates });
     if (result.matchedCount === 0) {
       throw new HttpError(404, "Room not found");
     }
-    const room = await roomsCol.findOne({ _id: oid });
+    const room = await Room.findById(oid).lean();
     res.json(serialize(room));
   })
 );
@@ -64,11 +61,11 @@ router.delete(
   requireOwner,
   asyncHandler(async (req, res) => {
     const oid = toObjectId(req.params.roomId);
-    const linked = await tenantsCol.countDocuments({ room_id: oid, status: "active" });
+    const linked = await Tenant.countDocuments({ room_id: oid, status: "active" });
     if (linked > 0) {
       throw new HttpError(400, "Cannot delete a room with an active tenant assigned");
     }
-    const result = await roomsCol.deleteOne({ _id: oid });
+    const result = await Room.deleteOne({ _id: oid });
     if (result.deletedCount === 0) {
       throw new HttpError(404, "Room not found");
     }
