@@ -11,7 +11,7 @@ const nextConfig = {
   env: {
     NEXT_PUBLIC_API_URL:
       process.env.NEXT_PUBLIC_API_URL ||
-      "https://YOUR_BACKEND_URL/api",
+      "https://rentflow-api-kwcy.onrender.com/api",
   },
 };
 
