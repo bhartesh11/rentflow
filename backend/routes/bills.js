@@ -1,5 +1,5 @@
 const express = require('express');
-const prisma = require('../lib/prisma');
+const { Bill, Tenant, MeterReading } = require('../models');
 const { authenticate, requireRole } = require('../middleware/auth');
 const asyncHandler = require('../utils/asyncHandler');
 const { buildBillPdf } = require('../lib/billPdf');
@@ -20,7 +20,7 @@ function computeTotal({ rent, electricityCharges, waterCharges, maintenance, oth
 }
 
 async function generateInvoiceNumber() {
-  const count = await prisma.bill.count();
+  const count = await Bill.countDocuments();
   const year = new Date().getFullYear();
   return `INV-${year}-${String(count + 1).padStart(5, '0')}`;
 }
@@ -29,19 +29,21 @@ async function generateInvoiceNumber() {
 router.get(
   '/',
   asyncHandler(async (req, res) => {
-    const where =
-      req.user.role === 'TENANT'
-        ? { tenant: { userId: req.user.id } }
-        : req.query.tenantId
-        ? { tenantId: req.query.tenantId }
-        : {};
-    if (req.query.status) where.paymentStatus = req.query.status;
+    let filter = {};
+    if (req.user.role === 'TENANT') {
+      const tenantIds = (await Tenant.find({ user: req.user.id }).select('_id')).map((t) => t._id);
+      filter = { tenant: { $in: tenantIds } };
+    } else if (req.query.tenantId) {
+      filter = { tenant: req.query.tenantId };
+    }
+    if (req.query.status) filter.paymentStatus = req.query.status;
 
-    const bills = await prisma.bill.findMany({
-      where,
-      include: { tenant: true, room: true, payments: true, meterReading: true },
-      orderBy: { billingMonth: 'desc' },
-    });
+    const bills = await Bill.find(filter)
+      .populate('tenant')
+      .populate('room')
+      .populate('payments')
+      .populate('meterReading')
+      .sort({ billingMonth: -1 });
     res.json({ bills });
   })
 );
@@ -77,9 +79,7 @@ router.post(
     let resolvedElectricityCharges = electricityCharges;
     let meterReading = null;
     if (meterReadingId) {
-      meterReading = await prisma.meterReading.findFirst({
-        where: { id: meterReadingId, roomId },
-      });
+      meterReading = await MeterReading.findOne({ _id: meterReadingId, room: roomId });
       if (!meterReading) {
         return res.status(404).json({ error: 'Meter reading not found for this room' });
       }
@@ -99,36 +99,28 @@ router.post(
       previousDue,
     });
 
-    const bill = await prisma.$transaction(async (tx) => {
-      const created = await tx.bill.create({
-        data: {
-          invoiceNumber: await generateInvoiceNumber(),
-          tenantId,
-          roomId,
-          billingMonth: new Date(billingMonth),
-          rent: Number(rent),
-          electricityCharges:
-            resolvedElectricityCharges != null ? Number(resolvedElectricityCharges) : null,
-          waterCharges: waterCharges != null ? Number(waterCharges) : null,
-          maintenance: maintenance != null ? Number(maintenance) : null,
-          otherCharges: otherCharges != null ? Number(otherCharges) : null,
-          discounts: discounts != null ? Number(discounts) : null,
-          previousDue: previousDue != null ? Number(previousDue) : null,
-          totalAmount,
-          dueDate: new Date(dueDate),
-          meterReadingId: meterReading ? meterReading.id : null,
-        },
-      });
-
-      if (meterReading) {
-        await tx.meterReading.update({
-          where: { id: meterReading.id },
-          data: { billed: true },
-        });
-      }
-
-      return created;
+    const bill = await Bill.create({
+      invoiceNumber: await generateInvoiceNumber(),
+      tenant: tenantId,
+      room: roomId,
+      billingMonth: new Date(billingMonth),
+      rent: Number(rent),
+      electricityCharges:
+        resolvedElectricityCharges != null ? Number(resolvedElectricityCharges) : null,
+      waterCharges: waterCharges != null ? Number(waterCharges) : null,
+      maintenance: maintenance != null ? Number(maintenance) : null,
+      otherCharges: otherCharges != null ? Number(otherCharges) : null,
+      discounts: discounts != null ? Number(discounts) : null,
+      previousDue: previousDue != null ? Number(previousDue) : null,
+      totalAmount,
+      dueDate: new Date(dueDate),
+      meterReading: meterReading ? meterReading._id : null,
     });
+
+    if (meterReading) {
+      meterReading.billed = true;
+      await meterReading.save();
+    }
 
     res.status(201).json({ bill });
   })
@@ -138,14 +130,16 @@ router.post(
 router.get(
   '/:id',
   asyncHandler(async (req, res) => {
-    const bill = await prisma.bill.findUnique({
-      where: { id: req.params.id },
-      include: { tenant: true, room: true, items: true, payments: true, meterReading: true },
-    });
+    const bill = await Bill.findById(req.params.id)
+      .populate('tenant')
+      .populate('room')
+      .populate('items')
+      .populate('payments')
+      .populate('meterReading');
     if (!bill) return res.status(404).json({ error: 'Bill not found' });
     if (req.user.role === 'TENANT') {
-      const tenant = await prisma.tenant.findUnique({ where: { id: bill.tenantId } });
-      if (!tenant || tenant.userId !== req.user.id) {
+      const tenant = await Tenant.findById(bill.tenant?._id || bill.tenant);
+      if (!tenant || String(tenant.user) !== String(req.user.id)) {
         return res.status(403).json({ error: 'You do not have permission to view this bill' });
       }
     }
@@ -157,14 +151,15 @@ router.get(
 router.get(
   '/:id/pdf',
   asyncHandler(async (req, res) => {
-    const bill = await prisma.bill.findUnique({
-      where: { id: req.params.id },
-      include: { tenant: true, room: { include: { property: true } }, payments: true, meterReading: true },
-    });
+    const bill = await Bill.findById(req.params.id)
+      .populate('tenant')
+      .populate({ path: 'room', populate: { path: 'property' } })
+      .populate('payments')
+      .populate('meterReading');
     if (!bill) return res.status(404).json({ error: 'Bill not found' });
     if (req.user.role === 'TENANT') {
-      const tenant = await prisma.tenant.findUnique({ where: { id: bill.tenantId } });
-      if (!tenant || tenant.userId !== req.user.id) {
+      const tenant = await Tenant.findById(bill.tenant?._id || bill.tenant);
+      if (!tenant || String(tenant.user) !== String(req.user.id)) {
         return res.status(403).json({ error: 'You do not have permission to view this bill' });
       }
     }
@@ -180,7 +175,7 @@ router.put(
   '/:id',
   requireRole('OWNER'),
   asyncHandler(async (req, res) => {
-    const existing = await prisma.bill.findUnique({ where: { id: req.params.id } });
+    const existing = await Bill.findById(req.params.id);
     if (!existing) return res.status(404).json({ error: 'Bill not found' });
 
     const {
@@ -203,20 +198,17 @@ router.put(
       previousDue: previousDue ?? existing.previousDue,
     });
 
-    const bill = await prisma.bill.update({
-      where: { id: req.params.id },
-      data: {
-        electricityCharges,
-        waterCharges,
-        maintenance,
-        otherCharges,
-        discounts,
-        previousDue,
-        dueDate: dueDate ? new Date(dueDate) : undefined,
-        totalAmount,
-      },
-    });
-    res.json({ bill });
+    if (electricityCharges !== undefined) existing.electricityCharges = electricityCharges;
+    if (waterCharges !== undefined) existing.waterCharges = waterCharges;
+    if (maintenance !== undefined) existing.maintenance = maintenance;
+    if (otherCharges !== undefined) existing.otherCharges = otherCharges;
+    if (discounts !== undefined) existing.discounts = discounts;
+    if (previousDue !== undefined) existing.previousDue = previousDue;
+    if (dueDate) existing.dueDate = new Date(dueDate);
+    existing.totalAmount = totalAmount;
+
+    await existing.save();
+    res.json({ bill: existing });
   })
 );
 
@@ -225,18 +217,13 @@ router.delete(
   '/:id',
   requireRole('OWNER'),
   asyncHandler(async (req, res) => {
-    const existing = await prisma.bill.findUnique({ where: { id: req.params.id } });
+    const existing = await Bill.findById(req.params.id);
     if (!existing) return res.status(404).json({ error: 'Bill not found' });
 
-    await prisma.$transaction(async (tx) => {
-      if (existing.meterReadingId) {
-        await tx.meterReading.update({
-          where: { id: existing.meterReadingId },
-          data: { billed: false },
-        });
-      }
-      await tx.bill.delete({ where: { id: req.params.id } });
-    });
+    if (existing.meterReading) {
+      await MeterReading.findByIdAndUpdate(existing.meterReading, { billed: false });
+    }
+    await Bill.findByIdAndDelete(req.params.id);
 
     res.json({ message: 'Bill deleted' });
   })

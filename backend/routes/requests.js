@@ -1,5 +1,5 @@
 const express = require('express');
-const prisma = require('../lib/prisma');
+const { Request, Tenant } = require('../models');
 const { authenticate, requireRole } = require('../middleware/auth');
 const asyncHandler = require('../utils/asyncHandler');
 
@@ -10,19 +10,18 @@ router.use(authenticate);
 router.get(
   '/',
   asyncHandler(async (req, res) => {
-    let where = {};
+    let filter = {};
     if (req.user.role === 'TENANT') {
-      const tenant = await prisma.tenant.findFirst({ where: { userId: req.user.id } });
-      where = tenant ? { tenantId: tenant.id } : { userId: req.user.id };
+      const tenant = await Tenant.findOne({ user: req.user.id });
+      filter = tenant ? { tenant: tenant._id } : { user: req.user.id };
     } else if (req.query.status) {
-      where = { status: req.query.status };
+      filter = { status: req.query.status };
     }
 
-    const requests = await prisma.request.findMany({
-      where,
-      include: { tenant: true, user: true },
-      orderBy: { createdAt: 'desc' },
-    });
+    const requests = await Request.find(filter)
+      .populate('tenant')
+      .populate('user')
+      .sort({ createdAt: -1 });
     res.json({ requests });
   })
 );
@@ -38,18 +37,16 @@ router.post(
 
     let tenantId = null;
     if (req.user.role === 'TENANT') {
-      const tenant = await prisma.tenant.findFirst({ where: { userId: req.user.id } });
-      tenantId = tenant ? tenant.id : null;
+      const tenant = await Tenant.findOne({ user: req.user.id });
+      tenantId = tenant ? tenant._id : null;
     }
 
-    const request = await prisma.request.create({
-      data: {
-        title,
-        description,
-        priority: priority || 'MEDIUM',
-        tenantId,
-        userId: req.user.id,
-      },
+    const request = await Request.create({
+      title,
+      description,
+      priority: priority || 'MEDIUM',
+      tenant: tenantId,
+      user: req.user.id,
     });
     res.status(201).json({ request });
   })
@@ -60,15 +57,15 @@ router.put(
   '/:id',
   requireRole('OWNER'),
   asyncHandler(async (req, res) => {
-    const existing = await prisma.request.findUnique({ where: { id: req.params.id } });
+    const existing = await Request.findById(req.params.id);
     if (!existing) return res.status(404).json({ error: 'Request not found' });
 
     const { status, priority } = req.body;
-    const request = await prisma.request.update({
-      where: { id: req.params.id },
-      data: { status, priority },
-    });
-    res.json({ request });
+    if (status !== undefined) existing.status = status;
+    if (priority !== undefined) existing.priority = priority;
+    await existing.save();
+
+    res.json({ request: existing });
   })
 );
 
@@ -76,12 +73,12 @@ router.put(
 router.delete(
   '/:id',
   asyncHandler(async (req, res) => {
-    const existing = await prisma.request.findUnique({ where: { id: req.params.id } });
+    const existing = await Request.findById(req.params.id);
     if (!existing) return res.status(404).json({ error: 'Request not found' });
-    if (req.user.role === 'TENANT' && existing.userId !== req.user.id) {
+    if (req.user.role === 'TENANT' && String(existing.user) !== String(req.user.id)) {
       return res.status(403).json({ error: 'You do not have permission to delete this request' });
     }
-    await prisma.request.delete({ where: { id: req.params.id } });
+    await Request.findByIdAndDelete(req.params.id);
     res.json({ message: 'Request deleted' });
   })
 );

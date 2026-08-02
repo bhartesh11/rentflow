@@ -4,6 +4,7 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+const connectDB = require('./lib/mongoose');
 
 const authRoutes = require('./routes/auth');
 const propertyRoutes = require('./routes/properties');
@@ -55,14 +56,34 @@ app.use('*', (req, res) => {
 // Error handling middleware (must be last)
 app.use((err, req, res, next) => {
   console.error(err.stack);
+
+  // A malformed id (e.g. not a valid ObjectId) in a route param or query
+  // should read as "not found", not a server error.
+  if (err.name === 'CastError') {
+    return res.status(404).json({ error: 'Resource not found' });
+  }
+  if (err.name === 'ValidationError') {
+    return res.status(400).json({ error: err.message });
+  }
+  if (err.code === 11000) {
+    return res.status(409).json({ error: 'A record with these details already exists' });
+  }
+
   const status = err.status || 500;
   res.status(status).json({ error: err.message || 'Something went wrong!' });
 });
 
 if (require.main === module) {
-  app.listen(PORT, () => {
-    console.log(`Server is running on port ${PORT}`);
-  });
+  connectDB()
+    .then(() => {
+      app.listen(PORT, () => {
+        console.log(`Server is running on port ${PORT}`);
+      });
+    })
+    .catch((err) => {
+      console.error('Failed to connect to MongoDB:', err.message);
+      process.exit(1);
+    });
 }
 
 module.exports = app;

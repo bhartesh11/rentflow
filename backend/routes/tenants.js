@@ -1,5 +1,5 @@
 const express = require('express');
-const prisma = require('../lib/prisma');
+const { Tenant, Room } = require('../models');
 const { authenticate, requireRole } = require('../middleware/auth');
 const asyncHandler = require('../utils/asyncHandler');
 const { buildTenantsXlsx, buildTenantsPdf } = require('../lib/tenantExport');
@@ -12,19 +12,18 @@ router.get(
   '/',
   asyncHandler(async (req, res) => {
     if (req.user.role === 'TENANT') {
-      const tenants = await prisma.tenant.findMany({
-        where: { userId: req.user.id },
-        include: { assignedRoom: { include: { property: true } } },
+      const tenants = await Tenant.find({ user: req.user.id }).populate({
+        path: 'assignedRoom',
+        populate: { path: 'property' },
       });
       return res.json({ tenants });
     }
 
     const { status } = req.query;
-    const tenants = await prisma.tenant.findMany({
-      where: status ? { status } : undefined,
-      include: { assignedRoom: { include: { property: true } } },
-      orderBy: { createdAt: 'desc' },
-    });
+    const filter = status ? { status } : {};
+    const tenants = await Tenant.find(filter)
+      .populate({ path: 'assignedRoom', populate: { path: 'property' } })
+      .sort({ createdAt: -1 });
     res.json({ tenants });
   })
 );
@@ -43,11 +42,9 @@ router.get(
     }
 
     const tenantIds = String(ids).split(',').filter(Boolean);
-    const tenants = await prisma.tenant.findMany({
-      where: { id: { in: tenantIds } },
-      include: { assignedRoom: { include: { property: true } } },
-      orderBy: { fullName: 'asc' },
-    });
+    const tenants = await Tenant.find({ _id: { $in: tenantIds } })
+      .populate({ path: 'assignedRoom', populate: { path: 'property' } })
+      .sort({ fullName: 1 });
     if (tenants.length === 0) return res.status(404).json({ error: 'No matching tenants found' });
 
     const filenameBase = `tenants-export-${new Date().toISOString().slice(0, 10)}`;
@@ -69,12 +66,12 @@ router.get(
 router.get(
   '/:id',
   asyncHandler(async (req, res) => {
-    const tenant = await prisma.tenant.findUnique({
-      where: { id: req.params.id },
-      include: { assignedRoom: { include: { property: true } }, bills: true, payments: true },
-    });
+    const tenant = await Tenant.findById(req.params.id)
+      .populate({ path: 'assignedRoom', populate: { path: 'property' } })
+      .populate('bills')
+      .populate('payments');
     if (!tenant) return res.status(404).json({ error: 'Tenant not found' });
-    if (req.user.role === 'TENANT' && tenant.userId !== req.user.id) {
+    if (req.user.role === 'TENANT' && String(tenant.user) !== String(req.user.id)) {
       return res.status(403).json({ error: 'You do not have permission to view this tenant' });
     }
     res.json({ tenant });
@@ -85,9 +82,9 @@ router.get(
 router.put(
   '/:id',
   asyncHandler(async (req, res) => {
-    const existing = await prisma.tenant.findUnique({ where: { id: req.params.id } });
+    const existing = await Tenant.findById(req.params.id);
     if (!existing) return res.status(404).json({ error: 'Tenant not found' });
-    if (req.user.role === 'TENANT' && existing.userId !== req.user.id) {
+    if (req.user.role === 'TENANT' && String(existing.user) !== String(req.user.id)) {
       return res.status(403).json({ error: 'You do not have permission to edit this tenant' });
     }
 
@@ -104,16 +101,23 @@ router.put(
       occupantsCount,
     } = req.body;
 
+    if (fullName !== undefined) existing.fullName = fullName;
+    if (mobileNumber !== undefined) existing.mobileNumber = mobileNumber;
+    if (address !== undefined) existing.address = address;
+    if (aadhaarNumber !== undefined) existing.aadhaarNumber = aadhaarNumber;
+    if (pan !== undefined) existing.pan = pan;
+    if (emergencyContact !== undefined) existing.emergencyContact = emergencyContact;
+    if (occupation !== undefined) existing.occupation = occupation;
+
     // Only owners may change status (approval / vacate), security deposit, or occupants
-    const data = { fullName, mobileNumber, address, aadhaarNumber, pan, emergencyContact, occupation };
     if (req.user.role === 'OWNER') {
-      if (status) data.status = status;
-      if (securityDeposit != null) data.securityDeposit = Number(securityDeposit);
-      if (occupantsCount != null) data.occupantsCount = Number(occupantsCount);
+      if (status) existing.status = status;
+      if (securityDeposit != null) existing.securityDeposit = Number(securityDeposit);
+      if (occupantsCount != null) existing.occupantsCount = Number(occupantsCount);
     }
 
-    const tenant = await prisma.tenant.update({ where: { id: req.params.id }, data });
-    res.json({ tenant });
+    await existing.save();
+    res.json({ tenant: existing });
   })
 );
 
@@ -122,14 +126,14 @@ router.put(
   '/:id/approve',
   requireRole('OWNER'),
   asyncHandler(async (req, res) => {
-    const existing = await prisma.tenant.findUnique({ where: { id: req.params.id } });
+    const existing = await Tenant.findById(req.params.id);
     if (!existing) return res.status(404).json({ error: 'Tenant not found' });
 
-    const tenant = await prisma.tenant.update({
-      where: { id: req.params.id },
-      data: { status: 'ACTIVE', joiningDate: existing.joiningDate || new Date() },
-    });
-    res.json({ tenant });
+    existing.status = 'ACTIVE';
+    existing.joiningDate = existing.joiningDate || new Date();
+    await existing.save();
+
+    res.json({ tenant: existing });
   })
 );
 
@@ -138,16 +142,13 @@ router.delete(
   '/:id',
   requireRole('OWNER'),
   asyncHandler(async (req, res) => {
-    const existing = await prisma.tenant.findUnique({ where: { id: req.params.id } });
+    const existing = await Tenant.findById(req.params.id);
     if (!existing) return res.status(404).json({ error: 'Tenant not found' });
 
-    if (existing.assignedRoomId) {
-      await prisma.room.update({
-        where: { id: existing.assignedRoomId },
-        data: { tenantId: null, occupancyStatus: 'VACANT' },
-      });
+    if (existing.assignedRoom) {
+      await Room.findByIdAndUpdate(existing.assignedRoom, { tenant: null, occupancyStatus: 'VACANT' });
     }
-    await prisma.tenant.delete({ where: { id: req.params.id } });
+    await Tenant.findByIdAndDelete(req.params.id);
     res.json({ message: 'Tenant deleted' });
   })
 );

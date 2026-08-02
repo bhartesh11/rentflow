@@ -1,7 +1,7 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const prisma = require('../lib/prisma');
+const { User, Tenant } = require('../models');
 const { authenticate } = require('../middleware/auth');
 const asyncHandler = require('../utils/asyncHandler');
 const { idProofUpload } = require('../lib/upload');
@@ -14,11 +14,6 @@ function signToken(user) {
   return jwt.sign({ userId: user.id, role: user.role }, process.env.JWT_SECRET, {
     expiresIn: '7d',
   });
-}
-
-function sanitizeUser(user) {
-  const { password, ...rest } = user;
-  return rest;
 }
 
 // POST /api/auth/register - property owner sign-up
@@ -34,18 +29,16 @@ router.post(
       return res.status(400).json({ error: 'Password must be at least 8 characters' });
     }
 
-    const existing = await prisma.user.findUnique({ where: { email } });
+    const existing = await User.findOne({ email });
     if (existing) {
       return res.status(409).json({ error: 'An account with this email already exists' });
     }
 
     const hashed = await bcrypt.hash(password, 10);
-    const user = await prisma.user.create({
-      data: { name, email, password: hashed, phone, role: 'OWNER' },
-    });
+    const user = await User.create({ name, email, password: hashed, phone, role: 'OWNER' });
 
     const token = signToken(user);
-    res.status(201).json({ token, user: sanitizeUser(user) });
+    res.status(201).json({ token, user: user.toJSON() });
   })
 );
 
@@ -58,7 +51,8 @@ router.post(
       return res.status(400).json({ error: 'Email and password are required' });
     }
 
-    const user = await prisma.user.findUnique({ where: { email } });
+    // password has `select: false` on the schema, so it must be requested explicitly
+    const user = await User.findOne({ email }).select('+password');
     if (!user) {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
@@ -69,7 +63,7 @@ router.post(
     }
 
     const token = signToken(user);
-    res.json({ token, user: sanitizeUser(user) });
+    res.json({ token, user: user.toJSON() });
   })
 );
 
@@ -112,7 +106,7 @@ router.post(
       return res.status(400).json({ error: 'ID proof number is required when an ID proof type is selected' });
     }
 
-    const existing = await prisma.user.findUnique({ where: { email } });
+    const existing = await User.findOne({ email });
     if (existing) {
       return res.status(409).json({ error: 'An account with this email already exists' });
     }
@@ -120,37 +114,44 @@ router.post(
     const hashed = await bcrypt.hash(password, 10);
     const idProofDocument = req.file ? `/uploads/id-proofs/${req.file.filename}` : null;
 
-    const result = await prisma.$transaction(async (tx) => {
-      const user = await tx.user.create({
-        data: { name: fullName, email, password: hashed, phone: mobileNumber, role: 'TENANT' },
-      });
-
-      const tenant = await tx.tenant.create({
-        data: {
-          fullName,
-          email,
-          mobileNumber,
-          address,
-          aadhaarNumber,
-          pan,
-          occupation,
-          joiningDate: joiningDate ? new Date(joiningDate) : null,
-          idProofType: idProofType || null,
-          idProofNumber: idProofNumber || null,
-          idProofDocument,
-          status: 'PENDING',
-          userId: user.id,
-        },
-      });
-
-      return { user, tenant };
+    // MongoDB transactions require a replica set; most simple/dev deployments
+    // (e.g. a single standalone mongod) don't have one, so this stays as two
+    // plain writes with manual rollback instead of prisma's $transaction.
+    const user = await User.create({
+      name: fullName,
+      email,
+      password: hashed,
+      phone: mobileNumber,
+      role: 'TENANT',
     });
 
-    const token = signToken(result.user);
+    let tenant;
+    try {
+      tenant = await Tenant.create({
+        fullName,
+        email,
+        mobileNumber,
+        address,
+        aadhaarNumber,
+        pan,
+        occupation,
+        joiningDate: joiningDate ? new Date(joiningDate) : null,
+        idProofType: idProofType || null,
+        idProofNumber: idProofNumber || null,
+        idProofDocument,
+        status: 'PENDING',
+        user: user._id,
+      });
+    } catch (err) {
+      await User.findByIdAndDelete(user._id);
+      throw err;
+    }
+
+    const token = signToken(user);
     res.status(201).json({
       token,
-      user: sanitizeUser(result.user),
-      tenant: result.tenant,
+      user: user.toJSON(),
+      tenant,
       message: 'Registration successful. Please wait for the property owner to approve your account.',
     });
   })
@@ -161,12 +162,9 @@ router.get(
   '/me',
   authenticate,
   asyncHandler(async (req, res) => {
-    const user = await prisma.user.findUnique({
-      where: { id: req.user.id },
-      include: { tenants: true },
-    });
+    const user = await User.findById(req.user.id).populate('tenants');
     if (!user) return res.status(404).json({ error: 'User not found' });
-    res.json({ user: sanitizeUser(user) });
+    res.json({ user: user.toJSON() });
   })
 );
 

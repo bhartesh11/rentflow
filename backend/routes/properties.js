@@ -1,5 +1,5 @@
 const express = require('express');
-const prisma = require('../lib/prisma');
+const { Property, Room } = require('../models');
 const { authenticate, requireRole } = require('../middleware/auth');
 const asyncHandler = require('../utils/asyncHandler');
 
@@ -11,11 +11,9 @@ router.get(
   '/',
   requireRole('OWNER'),
   asyncHandler(async (req, res) => {
-    const properties = await prisma.property.findMany({
-      where: { ownerId: req.user.id },
-      include: { rooms: true },
-      orderBy: { createdAt: 'desc' },
-    });
+    const properties = await Property.find({ owner: req.user.id })
+      .populate('rooms')
+      .sort({ createdAt: -1 });
     res.json({ properties });
   })
 );
@@ -35,27 +33,30 @@ router.post(
       return res.status(400).json({ error: 'numberOfRooms must be between 0 and 500' });
     }
 
-    const property = await prisma.$transaction(async (tx) => {
-      const created = await tx.property.create({
-        data: { name, address, city, state, pincode, description, ownerId: req.user.id },
-      });
-
-      // Convenience: auto-generate the requested number of blank rooms so the
-      // owner doesn't have to add each one by hand. They can edit rent/capacity after.
-      if (roomCount > 0) {
-        await tx.room.createMany({
-          data: Array.from({ length: roomCount }, (_, i) => ({
-            propertyId: created.id,
-            roomNumber: String(101 + i),
-            rentAmount: 0,
-            capacity: 1,
-          })),
-        });
-      }
-
-      return tx.property.findUnique({ where: { id: created.id }, include: { rooms: true } });
+    const created = await Property.create({
+      name,
+      address,
+      city,
+      state,
+      pincode,
+      description,
+      owner: req.user.id,
     });
 
+    // Convenience: auto-generate the requested number of blank rooms so the
+    // owner doesn't have to add each one by hand. They can edit rent/capacity after.
+    if (roomCount > 0) {
+      await Room.insertMany(
+        Array.from({ length: roomCount }, (_, i) => ({
+          property: created._id,
+          roomNumber: String(101 + i),
+          rentAmount: 0,
+          capacity: 1,
+        }))
+      );
+    }
+
+    const property = await Property.findById(created._id).populate('rooms');
     res.status(201).json({ property });
   })
 );
@@ -65,9 +66,9 @@ router.get(
   '/:id',
   requireRole('OWNER'),
   asyncHandler(async (req, res) => {
-    const property = await prisma.property.findFirst({
-      where: { id: req.params.id, ownerId: req.user.id },
-      include: { rooms: { include: { tenant: true } } },
+    const property = await Property.findOne({ _id: req.params.id, owner: req.user.id }).populate({
+      path: 'rooms',
+      populate: { path: 'tenant' },
     });
     if (!property) return res.status(404).json({ error: 'Property not found' });
     res.json({ property });
@@ -79,17 +80,20 @@ router.put(
   '/:id',
   requireRole('OWNER'),
   asyncHandler(async (req, res) => {
-    const existing = await prisma.property.findFirst({
-      where: { id: req.params.id, ownerId: req.user.id },
-    });
+    const existing = await Property.findOne({ _id: req.params.id, owner: req.user.id });
     if (!existing) return res.status(404).json({ error: 'Property not found' });
 
     const { name, address, city, state, pincode, description, status } = req.body;
-    const property = await prisma.property.update({
-      where: { id: req.params.id },
-      data: { name, address, city, state, pincode, description, status },
-    });
-    res.json({ property });
+    if (name !== undefined) existing.name = name;
+    if (address !== undefined) existing.address = address;
+    if (city !== undefined) existing.city = city;
+    if (state !== undefined) existing.state = state;
+    if (pincode !== undefined) existing.pincode = pincode;
+    if (description !== undefined) existing.description = description;
+    if (status !== undefined) existing.status = status;
+    await existing.save();
+
+    res.json({ property: existing });
   })
 );
 
@@ -98,19 +102,17 @@ router.delete(
   '/:id',
   requireRole('OWNER'),
   asyncHandler(async (req, res) => {
-    const existing = await prisma.property.findFirst({
-      where: { id: req.params.id, ownerId: req.user.id },
-    });
+    const existing = await Property.findOne({ _id: req.params.id, owner: req.user.id });
     if (!existing) return res.status(404).json({ error: 'Property not found' });
 
-    const roomCount = await prisma.room.count({ where: { propertyId: req.params.id } });
+    const roomCount = await Room.countDocuments({ property: req.params.id });
     if (roomCount > 0) {
       return res
         .status(400)
         .json({ error: 'Remove all rooms from this property before deleting it' });
     }
 
-    await prisma.property.delete({ where: { id: req.params.id } });
+    await Property.findByIdAndDelete(req.params.id);
     res.json({ message: 'Property deleted' });
   })
 );

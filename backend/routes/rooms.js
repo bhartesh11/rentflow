@@ -1,5 +1,5 @@
 const express = require('express');
-const prisma = require('../lib/prisma');
+const { Property, Room, Tenant, MeterReading } = require('../models');
 const { authenticate, requireRole } = require('../middleware/auth');
 const asyncHandler = require('../utils/asyncHandler');
 
@@ -7,15 +7,14 @@ const router = express.Router();
 router.use(authenticate);
 
 async function assertOwnsProperty(propertyId, ownerId) {
-  const property = await prisma.property.findFirst({ where: { id: propertyId, ownerId } });
-  return property;
+  return Property.findOne({ _id: propertyId, owner: ownerId });
 }
 
 async function assertOwnsRoom(roomId, ownerId) {
-  const room = await prisma.room.findFirst({
-    where: { id: roomId, property: { ownerId } },
-    include: { property: true, tenant: true },
-  });
+  const room = await Room.findById(roomId).populate('property').populate('tenant');
+  if (!room || !room.property || String(room.property.owner) !== String(ownerId)) {
+    return null;
+  }
   return room;
 }
 
@@ -25,15 +24,22 @@ router.get(
   requireRole('OWNER'),
   asyncHandler(async (req, res) => {
     const { propertyId, status } = req.query;
-    const rooms = await prisma.room.findMany({
-      where: {
-        property: { ownerId: req.user.id },
-        ...(propertyId ? { propertyId } : {}),
-        ...(status ? { occupancyStatus: status } : {}),
-      },
-      include: { property: true, tenant: true },
-      orderBy: { createdAt: 'desc' },
-    });
+
+    const ownedProperties = await Property.find({ owner: req.user.id }).select('_id');
+    const ownedIds = ownedProperties.map((p) => p._id.toString());
+
+    const filter = {};
+    if (propertyId) {
+      if (!ownedIds.includes(propertyId)) {
+        return res.json({ rooms: [] });
+      }
+      filter.property = propertyId;
+    } else {
+      filter.property = { $in: ownedIds };
+    }
+    if (status) filter.occupancyStatus = status;
+
+    const rooms = await Room.find(filter).populate('property').populate('tenant').sort({ createdAt: -1 });
     res.json({ rooms });
   })
 );
@@ -53,16 +59,14 @@ router.post(
     const property = await assertOwnsProperty(propertyId, req.user.id);
     if (!property) return res.status(404).json({ error: 'Property not found' });
 
-    const room = await prisma.room.create({
-      data: {
-        propertyId,
-        roomNumber,
-        floor,
-        rentAmount: Number(rentAmount),
-        depositAmount: depositAmount != null ? Number(depositAmount) : null,
-        capacity: Number(capacity),
-        notes,
-      },
+    const room = await Room.create({
+      property: propertyId,
+      roomNumber,
+      floor,
+      rentAmount: Number(rentAmount),
+      depositAmount: depositAmount != null ? Number(depositAmount) : null,
+      capacity: Number(capacity),
+      notes,
     });
     res.status(201).json({ room });
   })
@@ -88,18 +92,15 @@ router.put(
     if (!existing) return res.status(404).json({ error: 'Room not found' });
 
     const { roomNumber, floor, rentAmount, depositAmount, capacity, notes } = req.body;
-    const room = await prisma.room.update({
-      where: { id: req.params.id },
-      data: {
-        roomNumber,
-        floor,
-        rentAmount: rentAmount != null ? Number(rentAmount) : undefined,
-        depositAmount: depositAmount != null ? Number(depositAmount) : undefined,
-        capacity: capacity != null ? Number(capacity) : undefined,
-        notes,
-      },
-    });
-    res.json({ room });
+    if (roomNumber !== undefined) existing.roomNumber = roomNumber;
+    if (floor !== undefined) existing.floor = floor;
+    if (rentAmount != null) existing.rentAmount = Number(rentAmount);
+    if (depositAmount != null) existing.depositAmount = Number(depositAmount);
+    if (capacity != null) existing.capacity = Number(capacity);
+    if (notes !== undefined) existing.notes = notes;
+    await existing.save();
+
+    res.json({ room: existing });
   })
 );
 
@@ -110,10 +111,10 @@ router.delete(
   asyncHandler(async (req, res) => {
     const existing = await assertOwnsRoom(req.params.id, req.user.id);
     if (!existing) return res.status(404).json({ error: 'Room not found' });
-    if (existing.tenantId) {
+    if (existing.tenant) {
       return res.status(400).json({ error: 'Vacate the room before deleting it' });
     }
-    await prisma.room.delete({ where: { id: req.params.id } });
+    await Room.findByIdAndDelete(req.params.id);
     res.json({ message: 'Room deleted' });
   })
 );
@@ -132,9 +133,9 @@ router.post(
       return res.status(400).json({ error: 'Room is already occupied' });
     }
 
-    const tenant = await prisma.tenant.findUnique({ where: { id: tenantId } });
+    const tenant = await Tenant.findById(tenantId);
     if (!tenant) return res.status(404).json({ error: 'Tenant not found' });
-    if (tenant.assignedRoomId) {
+    if (tenant.assignedRoom) {
       return res.status(400).json({ error: 'Tenant is already assigned to a room' });
     }
 
@@ -145,39 +146,31 @@ router.post(
         .json({ error: `Number of occupants must be between 1 and the room's capacity (${room.capacity})` });
     }
 
-    const tx = [
-      prisma.room.update({
-        where: { id: req.params.id },
-        data: { tenantId, occupancyStatus: 'OCCUPIED' },
-      }),
-      prisma.tenant.update({
-        where: { id: tenantId },
-        data: { status: 'ACTIVE', assignedRoomId: req.params.id, occupantsCount: occupants },
-      }),
-    ];
+    room.tenant = tenantId;
+    room.occupancyStatus = 'OCCUPIED';
+    await room.save();
+
+    tenant.status = 'ACTIVE';
+    tenant.assignedRoom = req.params.id;
+    tenant.occupantsCount = occupants;
+    await tenant.save();
 
     // Record a baseline meter reading at move-in so the first real bill's "previous
     // reading" is accurate, rather than defaulting to 0.
     if (initialMeterReading != null && initialMeterReading !== '') {
-      tx.push(
-        prisma.meterReading.create({
-          data: {
-            roomId: req.params.id,
-            previousReading: Number(initialMeterReading),
-            currentReading: Number(initialMeterReading),
-            unitsConsumed: 0,
-            ratePerUnit: 0,
-            amount: 0,
-            readingMonth: initialMeterReadingDate ? new Date(initialMeterReadingDate) : new Date(),
-            billed: true, // baseline only - never itself billed
-          },
-        })
-      );
+      await MeterReading.create({
+        room: req.params.id,
+        previousReading: Number(initialMeterReading),
+        currentReading: Number(initialMeterReading),
+        unitsConsumed: 0,
+        ratePerUnit: 0,
+        amount: 0,
+        readingMonth: initialMeterReadingDate ? new Date(initialMeterReadingDate) : new Date(),
+        billed: true, // baseline only - never itself billed
+      });
     }
 
-    const [updatedRoom] = await prisma.$transaction(tx);
-
-    res.json({ room: updatedRoom });
+    res.json({ room });
   })
 );
 
@@ -189,22 +182,17 @@ router.post(
     const room = await assertOwnsRoom(req.params.id, req.user.id);
     if (!room) return res.status(404).json({ error: 'Room not found' });
 
-    const tx = [
-      prisma.room.update({
-        where: { id: req.params.id },
-        data: { tenantId: null, occupancyStatus: 'VACANT' },
-      }),
-    ];
-    if (room.tenantId) {
-      tx.push(
-        prisma.tenant.update({
-          where: { id: room.tenantId },
-          data: { status: 'VACATED', assignedRoomId: null },
-        })
-      );
+    const previousTenantId = room.tenant ? room.tenant._id || room.tenant : null;
+
+    room.tenant = null;
+    room.occupancyStatus = 'VACANT';
+    await room.save();
+
+    if (previousTenantId) {
+      await Tenant.findByIdAndUpdate(previousTenantId, { status: 'VACATED', assignedRoom: null });
     }
-    const [updatedRoom] = await prisma.$transaction(tx);
-    res.json({ room: updatedRoom });
+
+    res.json({ room });
   })
 );
 
@@ -216,14 +204,11 @@ router.get(
     const room = await assertOwnsRoom(req.params.id, req.user.id);
     if (!room) return res.status(404).json({ error: 'Room not found' });
 
-    const where = { roomId: req.params.id };
-    if (req.query.billed === 'false') where.billed = false;
-    if (req.query.billed === 'true') where.billed = true;
+    const filter = { room: req.params.id };
+    if (req.query.billed === 'false') filter.billed = false;
+    if (req.query.billed === 'true') filter.billed = true;
 
-    const meterReadings = await prisma.meterReading.findMany({
-      where,
-      orderBy: { readingMonth: 'desc' },
-    });
+    const meterReadings = await MeterReading.find(filter).sort({ readingMonth: -1 });
     res.json({ meterReadings });
   })
 );
@@ -246,10 +231,7 @@ router.post(
     const room = await assertOwnsRoom(req.params.id, req.user.id);
     if (!room) return res.status(404).json({ error: 'Room not found' });
 
-    const lastReading = await prisma.meterReading.findFirst({
-      where: { roomId: req.params.id },
-      orderBy: { readingMonth: 'desc' },
-    });
+    const lastReading = await MeterReading.findOne({ room: req.params.id }).sort({ readingMonth: -1 });
     const previousReading = lastReading ? lastReading.currentReading : 0;
 
     if (Number(currentReading) < previousReading) {
@@ -261,16 +243,14 @@ router.post(
     const unitsConsumed = Math.round((Number(currentReading) - previousReading) * 100) / 100;
     const amount = Math.round(unitsConsumed * Number(ratePerUnit) * 100) / 100;
 
-    const meterReading = await prisma.meterReading.create({
-      data: {
-        roomId: req.params.id,
-        previousReading,
-        currentReading: Number(currentReading),
-        unitsConsumed,
-        ratePerUnit: Number(ratePerUnit),
-        amount,
-        readingMonth: new Date(readingMonth),
-      },
+    const meterReading = await MeterReading.create({
+      room: req.params.id,
+      previousReading,
+      currentReading: Number(currentReading),
+      unitsConsumed,
+      ratePerUnit: Number(ratePerUnit),
+      amount,
+      readingMonth: new Date(readingMonth),
     });
     res.status(201).json({ meterReading });
   })

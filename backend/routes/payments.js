@@ -1,5 +1,5 @@
 const express = require('express');
-const prisma = require('../lib/prisma');
+const { Payment, Receipt, Bill, Tenant } = require('../models');
 const { authenticate, requireRole } = require('../middleware/auth');
 const asyncHandler = require('../utils/asyncHandler');
 
@@ -7,7 +7,7 @@ const router = express.Router();
 router.use(authenticate);
 
 async function generateReceiptNumber() {
-  const count = await prisma.receipt.count();
+  const count = await Receipt.countDocuments();
   const year = new Date().getFullYear();
   return `RCPT-${year}-${String(count + 1).padStart(5, '0')}`;
 }
@@ -16,18 +16,19 @@ async function generateReceiptNumber() {
 router.get(
   '/',
   asyncHandler(async (req, res) => {
-    const where =
-      req.user.role === 'TENANT'
-        ? { tenant: { userId: req.user.id } }
-        : req.query.tenantId
-        ? { tenantId: req.query.tenantId }
-        : {};
+    let filter = {};
+    if (req.user.role === 'TENANT') {
+      const tenantIds = (await Tenant.find({ user: req.user.id }).select('_id')).map((t) => t._id);
+      filter = { tenant: { $in: tenantIds } };
+    } else if (req.query.tenantId) {
+      filter = { tenant: req.query.tenantId };
+    }
 
-    const payments = await prisma.payment.findMany({
-      where,
-      include: { tenant: true, bill: true, receipt: true },
-      orderBy: { paymentDate: 'desc' },
-    });
+    const payments = await Payment.find(filter)
+      .populate('tenant')
+      .populate('bill')
+      .populate('receipt')
+      .sort({ paymentDate: -1 });
     res.json({ payments });
   })
 );
@@ -42,47 +43,39 @@ router.post(
       return res.status(400).json({ error: 'tenantId, amount and paymentMethod are required' });
     }
 
-    const result = await prisma.$transaction(async (tx) => {
-      let balance = null;
-      let bill = null;
+    let balance = null;
 
-      if (billId) {
-        bill = await tx.bill.findUnique({ where: { id: billId }, include: { payments: true } });
-        if (!bill) throw Object.assign(new Error('Bill not found'), { status: 404 });
+    if (billId) {
+      const bill = await Bill.findById(billId).populate('payments');
+      if (!bill) return res.status(404).json({ error: 'Bill not found' });
 
-        const alreadyPaid = bill.payments.reduce((sum, p) => sum + p.amount, 0);
-        const newPaidTotal = alreadyPaid + Number(amount);
-        balance = Math.round((bill.totalAmount - newPaidTotal) * 100) / 100;
+      const alreadyPaid = bill.payments.reduce((sum, p) => sum + p.amount, 0);
+      const newPaidTotal = alreadyPaid + Number(amount);
+      balance = Math.round((bill.totalAmount - newPaidTotal) * 100) / 100;
 
-        const paymentStatus = balance <= 0 ? 'PAID' : newPaidTotal > 0 ? 'PARTIAL' : 'PENDING';
-        await tx.bill.update({ where: { id: billId }, data: { paymentStatus } });
-      }
+      const paymentStatus = balance <= 0 ? 'PAID' : newPaidTotal > 0 ? 'PARTIAL' : 'PENDING';
+      bill.paymentStatus = paymentStatus;
+      await bill.save();
+    }
 
-      const payment = await tx.payment.create({
-        data: {
-          tenantId,
-          billId: billId || null,
-          amount: Number(amount),
-          paymentMethod,
-          notes,
-          balance,
-        },
-      });
-
-      const receipt = await tx.receipt.create({
-        data: {
-          receiptNumber: await generateReceiptNumber(),
-          paymentId: payment.id,
-          amountPaid: Number(amount),
-          balanceRemaining: balance != null ? balance : 0,
-          paymentDate: payment.paymentDate,
-        },
-      });
-
-      return { payment, receipt };
+    const payment = await Payment.create({
+      tenant: tenantId,
+      bill: billId || null,
+      amount: Number(amount),
+      paymentMethod,
+      notes,
+      balance,
     });
 
-    res.status(201).json(result);
+    const receipt = await Receipt.create({
+      receiptNumber: await generateReceiptNumber(),
+      payment: payment._id,
+      amountPaid: Number(amount),
+      balanceRemaining: balance != null ? balance : 0,
+      paymentDate: payment.paymentDate,
+    });
+
+    res.status(201).json({ payment, receipt });
   })
 );
 
@@ -90,14 +83,14 @@ router.post(
 router.get(
   '/:id',
   asyncHandler(async (req, res) => {
-    const payment = await prisma.payment.findUnique({
-      where: { id: req.params.id },
-      include: { tenant: true, bill: true, receipt: true },
-    });
+    const payment = await Payment.findById(req.params.id)
+      .populate('tenant')
+      .populate('bill')
+      .populate('receipt');
     if (!payment) return res.status(404).json({ error: 'Payment not found' });
     if (req.user.role === 'TENANT') {
-      const tenant = await prisma.tenant.findUnique({ where: { id: payment.tenantId } });
-      if (!tenant || tenant.userId !== req.user.id) {
+      const tenant = await Tenant.findById(payment.tenant?._id || payment.tenant);
+      if (!tenant || String(tenant.user) !== String(req.user.id)) {
         return res.status(403).json({ error: 'You do not have permission to view this payment' });
       }
     }

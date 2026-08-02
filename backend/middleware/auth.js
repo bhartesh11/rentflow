@@ -1,5 +1,5 @@
 const jwt = require('jsonwebtoken');
-const prisma = require('../lib/prisma');
+const { User } = require('../models');
 
 // Verifies the Bearer token and attaches the authenticated user to req.user
 async function authenticate(req, res, next) {
@@ -13,7 +13,7 @@ async function authenticate(req, res, next) {
 
     const payload = jwt.verify(token, process.env.JWT_SECRET);
 
-    const user = await prisma.user.findUnique({ where: { id: payload.userId } });
+    const user = await User.findById(payload.userId).catch(() => null);
     if (!user) {
       return res.status(401).json({ error: 'User no longer exists' });
     }
